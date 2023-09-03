@@ -38,7 +38,7 @@ import (
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskAPI "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/typeurl"
-	"github.com/dmcgowan/containerd-wasm/wasmtime"
+	"github.com/dmcgowan/containerd-wasm/dapr"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -64,7 +64,8 @@ type spec struct {
 
 // New returns a new shim service that can be used via GRPC
 func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func()) (shim.Shim, error) {
-	ep, err := wasmtime.NewOOMEpoller(publisher)
+	//setupDebuggerEvent()
+	ep, err := dapr.NewOOMEpoller(publisher)
 	if err != nil {
 		return nil, err
 	}
@@ -73,10 +74,10 @@ func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func
 		id:         id,
 		context:    ctx,
 		events:     make(chan interface{}, 128),
-		ec:         make(chan wasmtime.Exit),
+		ec:         make(chan dapr.Exit),
 		ep:         ep,
 		cancel:     shutdown,
-		containers: make(map[string]*wasmtime.Container),
+		containers: make(map[string]*dapr.Container),
 	}
 	go s.processExits()
 	if err := s.initPlatform(); err != nil {
@@ -95,13 +96,13 @@ type service struct {
 	context  context.Context
 	events   chan interface{}
 	platform rproc.Platform
-	ec       chan wasmtime.Exit
-	ep       *wasmtime.Epoller
+	ec       chan dapr.Exit
+	ep       *dapr.Epoller
 
 	// id only used in cleanup case
 	id string
 
-	containers map[string]*wasmtime.Container
+	containers map[string]*dapr.Container
 
 	cancel func()
 }
@@ -126,7 +127,7 @@ func newCommand(ctx context.Context, id, containerdBinary, containerdAddress str
 	}
 	cmd := exec.Command(self, args...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "GOMAXPROCS=4")
+	cmd.Env = append(os.Environ(), "GOMAXPROCS=4") //"CONTAINERD_SHIM_WASM_V1_WAIT_DEBUGGER="
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
@@ -217,7 +218,7 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 	//	return nil, err
 	//}
 
-	//runtime, err := wasmtime.ReadRuntime(path)
+	//runtime, err := dapr.ReadRuntime(path)
 	//if err != nil {
 	//	return nil, err
 	//}
@@ -238,18 +239,21 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 
 // Create a new initial process and container with the underlying OCI runtime
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *taskAPI.CreateTaskResponse, err error) {
+	setupDebuggerEvent()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	logrus.Infof("creating %s", r.ID)
+	ser, _ := json.Marshal(r)
 
-	container, err := wasmtime.NewContainer(ctx, s.platform, r, s.ec)
+	logrus.Infof("service Create %s", string(ser))
+
+	container, err := dapr.NewContainer(ctx, s.platform, r, s.ec)
 	if err != nil {
 		return nil, err
 	}
 
-	s.containers[r.ID] = container
-
+	s.containers[r.ID] = container // r.ID 为 container id，唯一的名称
+	// todo zc 看看send之后的消息流向
 	s.send(&eventstypes.TaskCreate{
 		ContainerID: r.ID,
 		Bundle:      r.Bundle,
@@ -271,7 +275,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 
 // Start a process
 func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
-	logrus.Infof("starting %s", r.ID)
+	logrus.Infof("service Start %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -308,6 +312,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 
 // Delete the initial process and container
 func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
+	logrus.Infof("service Delete %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -342,6 +347,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 
 // Exec an additional process inside the container
 func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*ptypes.Empty, error) {
+	logrus.Infof("service Exec: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -375,6 +381,7 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*
 
 // State returns runtime state information for a process
 func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.StateResponse, error) {
+	logrus.Infof("service State: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -417,6 +424,7 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 
 // Pause the container
 func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.Empty, error) {
+	logrus.Infof("service Pause: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -432,6 +440,7 @@ func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.E
 
 // Resume the container
 func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes.Empty, error) {
+	logrus.Infof("service Resume: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -447,6 +456,7 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes
 
 // Kill a process with the provided signal
 func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Empty, error) {
+	logrus.Infof("service Kill: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -459,6 +469,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Emp
 
 // Pids returns all pids inside the container
 func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.PidsResponse, error) {
+	logrus.Infof("service Pids: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -530,6 +541,7 @@ func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*pt
 
 // Wait for a process to exit
 func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
+	logrus.Infof("service Wait: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -548,6 +560,7 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 
 // Connect returns shim information such as the shim's pid
 func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*taskAPI.ConnectResponse, error) {
+	logrus.Infof("service Connect: %s", r.String())
 	var pid int
 	if container, err := s.getContainer(r.ID); err == nil {
 		pid = container.Pid()
@@ -559,6 +572,7 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*task
 }
 
 func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*ptypes.Empty, error) {
+	logrus.Infof("service Shutdown: %s", r.String())
 	s.mu.Lock()
 	// return out if the shim is still servicing containers
 	if len(s.containers) > 0 {
@@ -571,6 +585,7 @@ func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*pt
 }
 
 func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.StatsResponse, error) {
+	logrus.Infof("service Stats: %s", r.String())
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
@@ -609,7 +624,7 @@ func (s *service) processExits() {
 	}
 }
 
-func (s *service) checkProcesses(e wasmtime.Exit) {
+func (s *service) checkProcesses(e dapr.Exit) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -693,7 +708,7 @@ func (s *service) forward(ctx context.Context, publisher shim.Publisher) {
 	ctx = namespaces.WithNamespace(context.Background(), ns)
 	for e := range s.events {
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := publisher.Publish(ctx, wasmtime.GetTopic(e), e)
+		err := publisher.Publish(ctx, dapr.GetTopic(e), e)
 		cancel()
 		if err != nil {
 			logrus.WithError(err).Error("post event")
@@ -702,7 +717,7 @@ func (s *service) forward(ctx context.Context, publisher shim.Publisher) {
 	publisher.Close()
 }
 
-func (s *service) getContainer(id string) (*wasmtime.Container, error) {
+func (s *service) getContainer(id string) (*dapr.Container, error) {
 	s.mu.Lock()
 	container := s.containers[id]
 	s.mu.Unlock()
@@ -718,7 +733,7 @@ func (s *service) initPlatform() error {
 	if s.platform != nil {
 		return nil
 	}
-	p, err := wasmtime.NewPlatform()
+	p, err := dapr.NewPlatform()
 	if err != nil {
 		return err
 	}

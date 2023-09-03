@@ -17,19 +17,18 @@
    limitations under the License.
 */
 
-package wasmtime
+package dapr
 
 import (
 	"context"
 	"encoding/json"
+	"github.com/tetratelabs/wazero"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/containerd/cgroups"
@@ -414,7 +413,7 @@ type process struct {
 	exitTime   time.Time
 	stdio      rproc.Stdio
 	stdin      io.Closer
-	process    *os.Process
+	process    *Runtime
 	exited     chan struct{}
 	ec         chan<- Exit
 
@@ -487,26 +486,30 @@ func (p *process) Start(context.Context) (err error) {
 		// Hack for /pause
 		logrus.Info("exec pause")
 		cmd = exec.Command("./pause")
+		cmd.Run()
+		return nil
 	} else {
-		var args []string
-		args = append(args, "run", "--dir=.")
-
-		// for _, rm := range p.remaps {
-		// 	args = append(args, "--mapdir="+rm)
-		// }
-
-		for _, env := range p.env {
-			// Ignore the PATH env
-			if !strings.HasPrefix(env, "PATH=") {
-				args = append(args, "--env="+env)
-			}
-		}
-		args = append(args, p.args...)
-		logrus.Infof("exec wasmer %s", strings.Join(args, " "))
-		cmd = exec.Command("wasmer", args...)
+		//var args []string
+		//args = append(args, "run", "--dir=.")
+		//
+		//// for _, rm := range p.remaps {
+		//// 	args = append(args, "--mapdir="+rm)
+		//// }
+		//
+		//for _, env := range p.env {
+		//	// Ignore the PATH env
+		//	if !strings.HasPrefix(env, "PATH=") {
+		//		args = append(args, "--env="+env)
+		//	}
+		//}
+		//args = append(args, p.args...)
+		//logrus.Infof("exec wasmer %s", strings.Join(args, " "))
+		//cmd = exec.Command("wasmer", args...)
 	}
 
-	cmd.Dir = p.rootfs
+	moduleConfig := wazero.NewModuleConfig()
+
+	//cmd.Dir = p.rootfs
 
 	var in io.Closer
 	var closers []io.Closer
@@ -520,7 +523,8 @@ func (p *process) Start(context.Context) (err error) {
 				stdin.Close()
 			}
 		}()
-		cmd.Stdin = stdin
+		moduleConfig.WithStdin(stdin)
+		//cmd.Stdin = stdin
 		in = stdin
 		closers = append(closers, stdin)
 	}
@@ -535,7 +539,8 @@ func (p *process) Start(context.Context) (err error) {
 				stdout.Close()
 			}
 		}()
-		cmd.Stdout = stdout
+		//cmd.Stdout = stdout
+		moduleConfig.WithStdout(stdout)
 		closers = append(closers, stdout)
 	}
 
@@ -549,34 +554,34 @@ func (p *process) Start(context.Context) (err error) {
 				stderr.Close()
 			}
 		}()
-		cmd.Stderr = stderr
+		//cmd.Stderr = stderr
+		moduleConfig.WithStderr(stderr)
 		closers = append(closers, stderr)
 	}
 
+	c, err := LoadConfigFromFile("rootfs/config.yaml") // todo use p.rootfs
+	if err != nil {
+		return errors.Wrapf(err, "unable to read config file")
+	}
+	rt := NewRuntime(c, moduleConfig)
+	closers = append(closers, rt)
 	p.mu.Lock()
 	if p.process != nil {
 		return errors.Wrap(errdefs.ErrFailedPrecondition, "already running")
 	}
-	if err := cmd.Start(); err != nil {
+	if err := rt.Run(); err != nil {
 		p.mu.Unlock()
 		return err
 	}
-	p.process = cmd.Process
-	p.pid = cmd.Process.Pid
+	p.process = rt
+	//p.pid = cmd.Process.Pid
 	p.stdin = in
 	p.mu.Unlock()
 
 	go func() {
-		waitStatus, err := p.process.Wait()
+		p.process.Wait()
 		p.mu.Lock()
 		p.exitTime = time.Now()
-		if err != nil {
-			p.exitStatus = -1
-			logrus.WithError(err).Errorf("wait returned error")
-		} else if waitStatus != nil {
-			// TODO: Make this cross platform
-			p.exitStatus = int(waitStatus.Sys().(syscall.WaitStatus))
-		}
 		p.process = nil
 		p.mu.Unlock()
 
@@ -609,8 +614,7 @@ func (p *process) Kill(context.Context, uint32, bool) error {
 		// Ignore the kill signal
 		return nil
 	}
-
-	return p.process.Kill()
+	return p.process.Close()
 }
 
 func (p *process) SetExited(status int) {
