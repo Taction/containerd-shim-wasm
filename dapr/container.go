@@ -559,11 +559,11 @@ func (p *process) Start(context.Context) (err error) {
 		closers = append(closers, stderr)
 	}
 
-	c, err := LoadConfigFromFile("rootfs/config.yaml") // todo use p.rootfs
+	c, err := LoadConfigFromFile(filepath.Join(p.rootfs, "config.yaml")) // todo use p.rootfs
 	if err != nil {
 		return errors.Wrapf(err, "unable to read config file")
 	}
-	rt := NewRuntime(c, moduleConfig)
+	rt := NewRuntime(p.rootfs, c, moduleConfig)
 	closers = append(closers, rt)
 	p.mu.Lock()
 	if p.process != nil {

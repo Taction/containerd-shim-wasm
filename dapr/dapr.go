@@ -29,6 +29,7 @@ type Config struct {
 type Runtime struct {
 	finish          chan struct{}
 	close           chan struct{}
+	rootfs          string
 	config          *Config
 	instanceCounter atomic.Uint64
 	runtimeConfig   wazero.ModuleConfig
@@ -38,8 +39,8 @@ type Runtime struct {
 	moduleName string
 }
 
-func NewRuntime(c *Config, runtimeConfig wazero.ModuleConfig) *Runtime {
-	return &Runtime{config: c, runtimeConfig: runtimeConfig, finish: make(chan struct{}), close: make(chan struct{})}
+func NewRuntime(rootfs string, c *Config, runtimeConfig wazero.ModuleConfig) *Runtime {
+	return &Runtime{rootfs: rootfs, config: c, runtimeConfig: runtimeConfig, finish: make(chan struct{}), close: make(chan struct{})}
 }
 
 func (rt *Runtime) Run() error {
@@ -61,9 +62,16 @@ func (rt *Runtime) Wait() {
 func (rt *Runtime) initFromConfig() error {
 	wasmFile := rt.config.WASMPath
 	wasmName := filepath.Base(wasmFile)
-	wasmCode, err := os.ReadFile(filepath.Join("rootfs", wasmFile))
+	wasmCode, err := os.ReadFile(filepath.Join(rt.rootfs, wasmFile))
 	if err != nil {
-		return fmt.Errorf("could not read WASM file '%s': %w", wasmFile, err)
+		pwd, _ := os.Getwd()
+		// read all files and dirs from pwd
+		var files string
+		filepath.Walk(pwd, func(path string, info os.FileInfo, err error) error {
+			files += fmt.Sprintf("%s, ", info.Name())
+			return nil
+		})
+		return fmt.Errorf("could not read WASM file '%s' with rootfs '%s' in '%s' (existing file/dir: %s) err: %w", wasmFile, rt.rootfs, pwd, files, err)
 	}
 	ctx := context.Background()
 	runtime := wazero.NewRuntime(ctx)
@@ -127,7 +135,7 @@ func (rt *Runtime) runServer() error {
 
 func (rt *Runtime) runExecWasm() error {
 	if len(rt.config.ComponentPath) > 0 {
-		comps, err := LoadComponents(filepath.Join("rootfs", rt.config.ComponentPath))
+		comps, err := LoadComponents(filepath.Join(rt.rootfs, rt.config.ComponentPath))
 		if err != nil {
 			return err
 		}
